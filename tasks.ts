@@ -10,6 +10,7 @@
 import { Logger } from "@utils/Logger";
 import type { PluginNative } from "@utils/types";
 
+import { HeartbeatWatchdog } from "./heartbeatWatchdog";
 import { cleanupCreatedOAuthGrants } from "./oauthLifecycle";
 import type { Patcher } from "./patcher";
 import { isConsoleOnly, selectTaskFamily, taskEntries, taskForKey } from "./questConfig";
@@ -318,16 +319,15 @@ export class TaskRunner {
             let cleanupHook: () => void = () => { };
             let cleaned = false;
             let safetyTimer: number | undefined;
-            let watchdogTimer: number | undefined;
             let subscribed = false;
-            let beats = 0;
-            let failures = 0;
+            // Created below, after the spoof is installed, but cleanup can run before that.
+            let watchdog: HeartbeatWatchdog | null = null;
 
             const finish = () => {
                 if (cleaned) return;
                 cleaned = true;
                 clearTimeout(safetyTimer);
-                clearTimeout(watchdogTimer);
+                watchdog?.stop();
                 try { cleanupHook(); } catch (e: any) { debug(logger, `[Task] Cleanup: ${e?.message}`); }
                 if (subscribed) {
                     try { this.stores.Dispatcher?.unsubscribe(HEARTBEAT_EVT, check); }
@@ -373,26 +373,27 @@ export class TaskRunner {
                 resolve();
             }, MAX_TIME) as unknown as number;
 
-            const armWatchdog = () => {
-                clearTimeout(watchdogTimer);
-                watchdogTimer = setTimeout(() => {
+            watchdog = new HeartbeatWatchdog({
+                questName: t.name,
+                graceMs: HEARTBEAT_GRACE,
+                maxConsecutiveFailures: MAX_TASK_FAILURES,
+                setTimer: (fn, ms) => setTimeout(fn, ms) as unknown as number,
+                clearTimer: id => clearTimeout(id),
+                onFailureNoted: message => debug(logger, message),
+                onGiveUp: verdict => {
                     if (cleaned || !this.isTaskActive(t)) return;
-                    logger.error(beats === 0
-                        ? `[Task] Discord never reported progress for "${t.name}". It is not accepting the injected process on this client, so there is nothing to wait for.`
-                        : `[Task] Discord stopped reporting progress for "${t.name}" after ${beats} update(s). Giving up instead of idling.`);
-                    this.failTask(q, t, "No heartbeat from Discord");
+                    logger.error(verdict.message);
+                    this.failTask(q, t, verdict.reason);
                     finish();
                     resolve();
-                }, HEARTBEAT_GRACE) as unknown as number;
-            };
-            armWatchdog();
+                },
+            });
+            watchdog.start();
 
             const check = (d: any) => {
                 if (!this.isTaskActive(t)) { finish(); resolve(); return; }
                 if (d?.questId !== q.id) return;
-                beats++;
-                failures = 0;
-                armWatchdog();
+                watchdog?.beat();
                 const prog = this.readProgress(d.userStatus, key);
                 this.cb.onProgress(q.id, { name: t.name, type, cur: prog, max: t.target, status: "RUNNING" });
                 if (prog >= t.target) {
@@ -402,21 +403,13 @@ export class TaskRunner {
                 }
             };
 
-            // Discord retries a failed heartbeat, so one failure is not a verdict. Consecutive
-            // ones with nothing succeeding in between are, and saying so beats the watchdog's
-            // silence by up to 90 seconds and names the actual error instead of guessing.
+            // Discord does not retry a failed heartbeat, it just sends the next one on its own
+            // 60s tick, so one failure is not a verdict and must not be treated as silence.
+            // The watchdog decides what to do with it; consecutive failures are what give up.
             const onFail = (d: any) => {
                 if (!this.isTaskActive(t)) { finish(); resolve(); return; }
                 if (d?.questId !== q.id) return;
-                if (++failures < MAX_TASK_FAILURES) {
-                    debug(logger, `[Task] Discord's heartbeat for "${t.name}" failed (${failures}/${MAX_TASK_FAILURES}): ${describeHeartbeatError(d)}`);
-                    return;
-                }
-                const why = describeHeartbeatError(d);
-                logger.error(`[Task] Discord's heartbeat for "${t.name}" failed ${failures} times in a row: ${why}. Giving up rather than waiting out the watchdog.`);
-                this.failTask(q, t, `Discord could not report progress (${why})`);
-                finish();
-                resolve();
+                watchdog?.fail(describeHeartbeatError(d));
             };
 
             try {
