@@ -140,6 +140,10 @@
         ID: "1412491570820812933",  // blacklisted quest, known to break enrollment
         EVT: Object.freeze({
             HEARTBEAT: "QUESTS_SEND_HEARTBEAT_SUCCESS",
+            // Discord dispatches this when its own heartbeat POST fails, carrying the error and
+            // the quest id. Without it a failed beat is indistinguishable from silence, which is
+            // how a single transient error used to end a game quest 90s later (issue #74).
+            HEARTBEAT_FAIL: "QUESTS_SEND_HEARTBEAT_FAILURE",
             GAME: "RUNNING_GAMES_CHANGE",
             RPC: "LOCAL_ACTIVITY_UPDATE"
         })
@@ -1202,6 +1206,24 @@
         }
     };
 
+    // Pull something a user can act on out of a QUESTS_SEND_HEARTBEAT_FAILURE payload. Discord
+    // wraps the failure in its own error type, so the useful parts sit at different depths
+    // depending on whether the request got a response at all.
+    const describeHeartbeatError = payload => {
+        const e = payload?.error ?? payload;
+        const parts = [];
+        const status = e?.status ?? e?.httpStatus;
+        if (status) parts.push(`HTTP ${status}`);
+        const code = e?.body?.code ?? e?.code;
+        if (code != null && code !== status) parts.push(`code ${code}`);
+        const message = e?.body?.message ?? e?.message;
+        if (message) parts.push(String(message));
+        if (!parts.length) {
+            try { parts.push(JSON.stringify(e).slice(0, 160)); } catch { parts.push(String(e)); }
+        }
+        return parts.join(', ') || 'no detail';
+    };
+
     /* ── task handlers ────────────────────────────────────────────
        Each quest type (VIDEO, GAME, STREAM, ACTIVITY) has its own
        handler. GAME/STREAM share a generic() path that patches stores
@@ -1446,6 +1468,9 @@
                 let safetyTimer;
                 let watchdogTimer;
                 let beats = 0;
+                let failedBeats = 0;          // failures over the whole task, for the message
+                let consecutiveFailures = 0;  // reset by any successful beat, this one gives up
+                let lastFailure = null;
 
                 if (type === "STREAM") {
                     if (Mods.StreamStore) {
@@ -1485,6 +1510,9 @@
                     try { Mods.Dispatcher?.unsubscribe(CONST.EVT.HEARTBEAT, check); } catch (e) {
                         Logger.log(`[Dispatcher] Unsubscribe failed: ${e.message}`, 'debug');
                     }
+                    try { Mods.Dispatcher?.unsubscribe(CONST.EVT.HEARTBEAT_FAIL, onFail); } catch (e) {
+                        Logger.log(`[Dispatcher] Unsubscribe failed: ${e.message}`, 'debug');
+                    }
                     RUNTIME.cleanups.delete(abort);
                 };
 
@@ -1503,8 +1531,8 @@
                 // Discord drives these quests: it sends /quests/{id}/heartbeat itself while it
                 // believes the game runs, and we only read the replies. If it never accepts the
                 // injected process, no heartbeat ever arrives and the task would sit "RUNNING"
-                // for the full 25 minutes with nothing happening. Give up after 90s (3 missed
-                // beats at the usual ~30s cadence) and say why.
+                // for the full 25 minutes with nothing happening. Give up after 90s of silence
+                // and say why.
                 // Re-armed on every beat rather than checked once, so it also catches a quest that
                 // beats a few times and then goes silent. A one-shot `beats > 0` test would let that
                 // sit RUNNING for the full 25 minutes while the ticker extrapolated the bar to 100%,
@@ -1513,10 +1541,17 @@
                     clearTimeout(watchdogTimer);
                     watchdogTimer = setTimeout(() => {
                         if (cleaned || !RUNTIME.running) return;
+                        const failureTail = failedBeats > 0
+                            ? ` and ${failedBeats} failed beat(s), the last one ${lastFailure}`
+                            : '';
                         Logger.log(beats === 0
-                            ? `[Task] Discord never reported progress for "${t.name}". It is not accepting the injected process on this client, so there is nothing to wait for.`
-                            : `[Task] Discord stopped reporting progress for "${t.name}" after ${beats} update(s). Giving up instead of idling.`, 'err');
-                        Tasks.failTask(q, t, 'No heartbeat from Discord');
+                            ? (failedBeats > 0
+                                ? `[Task] Discord never reported progress for "${t.name}". All ${failedBeats} heartbeat(s) it tried failed, the last one ${lastFailure}.`
+                                : `[Task] Discord never reported progress for "${t.name}". It is not accepting the injected process on this client, so there is nothing to wait for.`)
+                            : `[Task] Discord stopped reporting progress for "${t.name}" after ${beats} update(s)${failureTail}. Giving up instead of idling.`, 'err');
+                        Tasks.failTask(q, t, failedBeats > 0
+                            ? `No heartbeat from Discord (${failedBeats} failed beat(s))`
+                            : 'No heartbeat from Discord');
                         finish();
                         resolve();
                     }, SYS.HEARTBEAT_GRACE);
@@ -1528,6 +1563,7 @@
                     if (d?.questId !== q.id) return;
 
                     beats++;
+                    consecutiveFailures = 0;
                     armWatchdog();
                     const prog = Tasks.readProgress(d.userStatus, key);
                     // anchor for the ticker: it extrapolates from here until the next beat
@@ -1543,7 +1579,36 @@
                     }
                 };
 
+                // Discord does not retry a failed beat: the sender dispatches the failure and the
+                // next attempt is the tick it already scheduled 60s out. So a failure is proof
+                // Discord is still driving the quest, and the watchdog is rearmed for it rather
+                // than counting it as silence. Consecutive failures are what give up, which also
+                // makes Discord's own status code reachable instead of a guess (issue #74).
+                // The exception is a failure before any credited beat: that keeps the original
+                // deadline, because "not accepting the injected process" is the issue #43 answer
+                // and is worth a beat and a half rather than five minutes of retries.
+                const onFail = (d) => {
+                    if (!RUNTIME.running) { finish(); resolve(); return; }
+                    if (d?.questId !== q.id) return;
+
+                    failedBeats++;
+                    consecutiveFailures++;
+                    lastFailure = describeHeartbeatError(d);
+
+                    if (consecutiveFailures >= SYS.MAX_TASK_FAILURES) {
+                        Logger.log(`[Task] Discord's heartbeat for "${t.name}" failed ${consecutiveFailures} times in a row: ${lastFailure}. Giving up rather than waiting out the watchdog.`, 'err');
+                        Tasks.failTask(q, t, `Discord could not report progress (${lastFailure})`);
+                        finish();
+                        resolve();
+                        return;
+                    }
+
+                    Logger.log(`[Task] Discord's heartbeat for "${t.name}" failed (${consecutiveFailures}/${SYS.MAX_TASK_FAILURES}): ${lastFailure}`, 'debug');
+                    if (beats > 0) armWatchdog();
+                };
+
                 Mods.Dispatcher?.subscribe(CONST.EVT.HEARTBEAT, check);
+                Mods.Dispatcher?.subscribe(CONST.EVT.HEARTBEAT_FAIL, onFail);
                 RUNTIME.cleanups.add(abort);
             });
         },

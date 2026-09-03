@@ -131,6 +131,7 @@ discord-quest-completer/
 ├── taskControl.ts     # per-quest task generations, cancellation and scoped cleanup
 ├── questTarget.ts     # pause/resume quest target resolution
 ├── questConfig.ts     # taskConfigV2 / legacy task helpers
+├── heartbeatWatchdog.ts  # when a GAME/STREAM task stops waiting on Discord
 ├── oauthLifecycle.ts  # account-safe compensating OAuth cleanup
 ├── traffic.ts    # FIFO request queue with exponential backoff
 ├── tasks.ts      # per-type handlers (VIDEO / GAME / STREAM / ACTIVITY / ACHIEVEMENT)

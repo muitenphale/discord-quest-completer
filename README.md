@@ -107,7 +107,7 @@ The plugin has the same options as real settings, plus auto-start, per-type conc
 | 429 or 5xx | Exponential backoff and re-queue, up to 3 retries. Global and per-endpoint limits are tracked separately. |
 | 404 or 403 on enroll | Quest goes on a skip list and the run continues. |
 | 5 consecutive failures on one task | That task is abandoned, the rest keep going. |
-| A game quest gets no heartbeat for 90s | Aborted with a reason, instead of sitting there until the timeout. |
+| A game quest gets nothing from Discord for 90s | Aborted with a reason, instead of sitting there until the timeout. A beat that Discord tried and failed is not silence: it resets the wait, and five in a row is what gives up. |
 | 25 minutes on one task | Hard stop, next quest. |
 | Auto-claim fails | A CLAIM button appears on the task card. |
 | A crash | The re-entry lock is released and every patch is reverted, so you can paste again without reloading. |
