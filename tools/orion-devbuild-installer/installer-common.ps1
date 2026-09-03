@@ -374,6 +374,57 @@ function Start-DiscordFlavors {
     return @($failed | Select-Object -Unique)
 }
 
+function Update-CompanionUserplugins {
+    <#
+      Fast-forward every other git-checked-out userplugin sitting beside orionQuests.
+
+      People run companion plugins in this checkout, QuestUI being the one this came from, and
+      updating one meant knowing the git command and running it by hand. UPDATE.cmd already
+      rebuilds the whole tree, so the plugins it compiles in may as well be current.
+
+      --ff-only on purpose, never a reset. This touches somebody else's repository, so a plugin
+      with local edits or a diverged branch is reported and left exactly as it was rather than
+      quietly discarded. A pull that fails is not fatal either: the build still runs with the
+      checkout that is already on disk, and the transactional build is what decides whether the
+      result ships.
+    #>
+    param([Parameter(Mandatory)][string]$InstallDir)
+
+    $root = Join-Path $InstallDir 'src\userplugins'
+    $results = @()
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return $results }
+
+    foreach ($dir in Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue) {
+        if ($dir.Name -eq 'orionQuests') { continue }
+
+        if (-not (Test-Path -LiteralPath (Join-Path $dir.FullName '.git'))) {
+            $results += [pscustomobject]@{ Name = $dir.Name; Status = 'skipped'; Detail = 'not a git checkout' }
+            continue
+        }
+
+        $before = (& git -C $dir.FullName rev-parse HEAD 2>$null)
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $output = (& git -C $dir.FullName pull --ff-only 2>&1) -join ' '
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prev
+        $after = (& git -C $dir.FullName rev-parse HEAD 2>$null)
+
+        if ($code -ne 0) {
+            $results += [pscustomobject]@{ Name = $dir.Name; Status = 'failed'; Detail = $output.Trim() }
+        } elseif ($before -ne $after) {
+            $results += [pscustomobject]@{ Name = $dir.Name; Status = 'updated'; Detail = "$($before.Substring(0, 7)) -> $($after.Substring(0, 7))" }
+        } else {
+            $results += [pscustomobject]@{ Name = $dir.Name; Status = 'current'; Detail = $after.Substring(0, 7) }
+        }
+    }
+
+    # No unary comma here. Wrapping the array makes the caller's @() see one nested element
+    # instead of the rows, and every call site already wraps, so a bare return is what works
+    # for zero, one and many.
+    return $results
+}
+
 function Get-PnpmInvocation {
     param([Parameter(Mandatory)][string]$PackageJsonPath)
 

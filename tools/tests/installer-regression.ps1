@@ -84,6 +84,63 @@ try {
     Assert-Equal @((Get-ChildItem -LiteralPath $temp -Filter '.orion-dist-health.sha256.replace-*' -ErrorAction SilentlyContinue)).Count 0 'Health-stamp replacement must not leave its disposable backup behind.'
 } finally { Remove-Item $temp -Recurse -Force -ErrorAction SilentlyContinue }
 
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Host '  SKIP: companion userplugin update test needs git on PATH.' -ForegroundColor Yellow
+} else {
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("orion-companion-test-" + [guid]::NewGuid().ToString('N'))
+    try {
+        $git = { param([string[]]$GitArgs) & git @GitArgs 2>$null | Out-Null }
+        $upstream = Join-Path $temp 'upstream'
+        New-Item -ItemType Directory -Force -Path $upstream | Out-Null
+        & $git @('-C', $upstream, 'init', '--quiet', '--initial-branch=main')
+        & $git @('-C', $upstream, 'config', 'user.email', 'test@example.invalid')
+        & $git @('-C', $upstream, 'config', 'user.name', 'installer regression')
+        Set-Content -LiteralPath (Join-Path $upstream 'index.tsx') -Value 'first' -Encoding ASCII
+        & $git @('-C', $upstream, 'add', '-A')
+        & $git @('-C', $upstream, 'commit', '--quiet', '-m', 'first')
+
+        $userplugins = Join-Path $temp 'install\src\userplugins'
+        New-Item -ItemType Directory -Force -Path $userplugins | Out-Null
+        & $git @('clone', '--quiet', $upstream, (Join-Path $userplugins 'Companion'))
+        & $git @('clone', '--quiet', $upstream, (Join-Path $userplugins 'Diverged'))
+        # orionQuests has its own update path above this one and must never be touched twice
+        & $git @('clone', '--quiet', $upstream, (Join-Path $userplugins 'orionQuests'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $userplugins 'CopiedPlugin') | Out-Null
+        Set-Content -LiteralPath (Join-Path $userplugins 'CopiedPlugin\index.tsx') -Value 'hand copied' -Encoding ASCII
+
+        # a commit only the local clone has, so a fast-forward is impossible
+        $diverged = Join-Path $userplugins 'Diverged'
+        & $git @('-C', $diverged, 'config', 'user.email', 'test@example.invalid')
+        & $git @('-C', $diverged, 'config', 'user.name', 'installer regression')
+        Set-Content -LiteralPath (Join-Path $diverged 'local.txt') -Value 'local work' -Encoding ASCII
+        & $git @('-C', $diverged, 'add', '-A')
+        & $git @('-C', $diverged, 'commit', '--quiet', '-m', 'local only')
+        $divergedHead = (& git -C $diverged rev-parse HEAD)
+
+        Set-Content -LiteralPath (Join-Path $upstream 'index.tsx') -Value 'second' -Encoding ASCII
+        & $git @('-C', $upstream, 'add', '-A')
+        & $git @('-C', $upstream, 'commit', '--quiet', '-m', 'second')
+
+        $results = @(Update-CompanionUserplugins -InstallDir (Join-Path $temp 'install'))
+        $byName = @{}
+        foreach ($r in $results) { $byName[$r.Name] = $r }
+
+        Assert-False ($byName.ContainsKey('orionQuests')) 'orionQuests has its own update path and must be excluded from the companion sweep.'
+        Assert-Equal $byName['Companion'].Status 'updated' 'A companion plugin behind its upstream must be fast-forwarded.'
+        Assert-Equal (Get-Content -LiteralPath (Join-Path $userplugins 'Companion\index.tsx') -Raw).Trim() 'second' 'The fast-forwarded companion must have the new upstream content on disk.'
+        Assert-Equal $byName['CopiedPlugin'].Status 'skipped' 'A hand-copied plugin folder is not a checkout and must be reported as left alone.'
+        Assert-Equal $byName['Diverged'].Status 'failed' 'A plugin that cannot fast-forward must be reported as failed rather than reset.'
+        Assert-Equal (& git -C $diverged rev-parse HEAD) $divergedHead 'A failed fast-forward must leave the companion checkout exactly where it was.'
+        Assert-True (Test-Path -LiteralPath (Join-Path $diverged 'local.txt')) 'Local work in a companion checkout must survive an update run.'
+
+        $again = @(Update-CompanionUserplugins -InstallDir (Join-Path $temp 'install'))
+        $companionAgain = $again | Where-Object { $_.Name -eq 'Companion' }
+        Assert-Equal $companionAgain.Status 'current' 'A companion already at upstream must report current rather than updated.'
+
+        Assert-Equal @(Update-CompanionUserplugins -InstallDir (Join-Path $temp 'no-such-install')).Count 0 'A missing userplugins directory must return nothing instead of throwing.'
+    } finally { Remove-Item $temp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 $temp = Join-Path ([IO.Path]::GetTempPath()) ("orion-asar-test-" + [guid]::NewGuid().ToString('N'))
 try {
     $resources = Join-Path $temp 'resources'

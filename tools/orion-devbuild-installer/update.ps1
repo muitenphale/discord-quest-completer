@@ -94,6 +94,19 @@ if (-not $pluginReady) {
     }
 }
 
+$companions = @(Update-CompanionUserplugins -InstallDir $InstallDir)
+if ($companions.Count -gt 0) {
+    Info 'Updating other userplugins in this checkout...'
+    foreach ($c in $companions) {
+        switch ($c.Status) {
+            'updated' { Good "  $($c.Name): $($c.Detail)" }
+            'current' { Info  "  $($c.Name): already up to date ($($c.Detail))" }
+            'skipped' { Info  "  $($c.Name): left alone, $($c.Detail)" }
+            default   { Warn  "  $($c.Name): could not update, leaving it as it is. $($c.Detail)" }
+        }
+    }
+}
+
 Push-Location $InstallDir
 try {
     try { $pnpm = Get-PnpmInvocation -PackageJsonPath (Join-Path $InstallDir 'package.json') }
@@ -102,7 +115,16 @@ try {
     Step 'pnpm install' { Invoke-Pnpm -Invocation $pnpm -Arguments @('install') }
     Info 'Building transactionally...'
     try { Invoke-VencordBuildTransactional -InstallDir $InstallDir -Invocation $pnpm -RequiredMarker 'OrionQuests' }
-    catch { Fail $_.Exception.Message }
+    catch {
+        # Name what else moved this run. A build that breaks right after a third-party plugin
+        # pulled a new commit is usually that plugin, and without this line the error reads as
+        # though Orion broke.
+        $moved = @($companions | Where-Object { $_.Status -eq 'updated' } | ForEach-Object { $_.Name })
+        if ($moved.Count -gt 0) {
+            Warn "  These userplugins also moved in this run: $($moved -join ', '). A build that breaks right after one of them pulled is usually that plugin, not Orion."
+        }
+        Fail $_.Exception.Message
+    }
     Good 'Build verified. The previous working dist would have been restored automatically on failure.'
 } finally { Pop-Location }
 
