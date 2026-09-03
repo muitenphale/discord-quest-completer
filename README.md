@@ -128,6 +128,14 @@ Stores are found by class name (`constructor.displayName`), the Dispatcher by it
 
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) is the full internal tour.
 
+## Companion plugins
+
+Not alternatives to this, things that run alongside it.
+
+- [Herzchens/QuestUI](https://github.com/Herzchens/QuestUI), a Vencord plugin that adds the quest interface Orion deliberately does not: Quest Home shortcuts, status indicators, and an optional dashboard that can drive Orion. It does not complete, accept or claim anything itself, so it is useful with or without this plugin. Requested in [#48](https://github.com/nyxxbit/discord-quest-completer/issues/48).
+
+  It reads the engine through Orion's control surface rather than poking at its internals, which means Orion stays the source of truth for what is running. Checked live before listing it, with both plugins in one build: every state change made from `/orion` showed up in an already-open QuestUI dashboard, including a per-quest pause it had not issued itself, and the card list grew as the scheduler queued more quests without a reopen. Separate project, separate maintainer, and bugs in it belong in its tracker.
+
 ## Other tools
 
 Worth knowing about, and worth knowing their state. All three were last updated before the July 2026 change described above, and none has shipped since.
