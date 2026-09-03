@@ -152,4 +152,4 @@ NOTES
 ------------------------------------------------------------
   - Using mods on Discord violates the Terms of Service. The ban risk is yours.
   - Project source: github.com/nyxxbit/discord-quest-completer
-  - Version: v4.10.11
+  - Version: v4.10.12
